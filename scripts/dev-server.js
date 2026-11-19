@@ -7,6 +7,7 @@ const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const collection = require('../api/collection.js');
+const audio = require('../api/audio.js');
 
 const root = path.join(__dirname, '..', 'web');
 const port = Number(process.env.PORT) || 8790;
@@ -15,6 +16,7 @@ const types = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; ch
 
 http.createServer((req, res) => {
   const url = new URL(req.url, 'http://localhost');
+  if (url.pathname === '/api/audio') return audio(req, res);
   if (url.pathname === '/api/collection') {
     // The same shape Vercel gives a function.
     req.query = Object.fromEntries(url.searchParams);

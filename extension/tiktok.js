@@ -64,6 +64,11 @@
 
   function track(item) {
     const music = item.music || {};
+    const video = item.video || {};
+    const addresses = Array.isArray(video.playAddr) ? video.playAddr : video.playAddr?.urlList || video.playAddr?.url_list;
+    const [primaryVideo = '', ...videoFallbacks] = [...new Set([
+      firstUrl(video.playAddr), ...(Array.isArray(addresses) ? addresses : []), firstUrl(video.downloadAddr)
+    ].filter(url => typeof url === 'string' && /^https:\/\//.test(url)))];
     const author = item.author?.uniqueId || item.author?.unique_id || '';
     const caption = cleanCaption(item.desc || '');
     const useCaption = music.original || !music.title;
@@ -71,10 +76,11 @@
       id: String(item.id),
       title: (useCaption ? caption || music.title : music.title) || 'Untitled clip',
       artist: useCaption ? (author ? `@${author}` : music.authorName || '') : music.authorName || (author ? `@${author}` : ''),
-      duration: item.video?.duration || music.duration || null,
-      artwork: item.video?.cover || item.video?.originCover || firstUrl(music.coverLarge) || music.coverMedium || '',
-      motion: item.video?.dynamicCover || '',
-      video: item.video?.playAddr || '',
+      duration: video.duration || music.duration || null,
+      artwork: firstUrl(video.cover) || firstUrl(video.originCover) || firstUrl(music.coverLarge) || firstUrl(music.coverMedium),
+      motion: firstUrl(video.dynamicCover),
+      video: primaryVideo,
+      videoFallbacks,
       audio: music.playUrl || ''
     };
   }
@@ -97,17 +103,30 @@
   // gets the current clip's video from here in small pieces. Only TikTok's own video hosts are fetched.
   const VIDEO_HOST = /(^|\.)(tiktokcdn\.com|tiktokcdn-us\.com|tiktokv\.com|tiktokv\.us|tiktok\.com)$/;
   const PIECE = 512 * 1024;
+  const MAX_VIDEO_BYTES = 20 * 1024 * 1024;
   async function videoPiece(address, start) {
     let url;
     try { url = new URL(address); } catch { throw new Error('Unknown video.'); }
     if (url.protocol !== 'https:' || !VIDEO_HOST.test(url.hostname) || !Number.isInteger(start) || start < 0) throw new Error('Unknown video.');
     const response = await fetch(url, { credentials: 'include', headers: { Range: `bytes=${start}-${start + PIECE - 1}` } });
     if (response.status !== 206 && response.status !== 200) throw new Error(`TikTok returned ${response.status}.`);
+    const whole = response.status === 200;
+    const range = /^bytes (\d+)-(\d+)\/(\d+)$/.exec(response.headers.get('content-range') || '');
+    const length = Number(response.headers.get('content-length'));
+    if ((whole && start !== 0) || (!whole && (!range || Number(range[1]) !== start ||
+        Number(range[2]) < start || Number(range[2]) >= start + PIECE || Number(range[2]) >= Number(range[3]))) ||
+        length > MAX_VIDEO_BYTES || Number(range?.[3]) > MAX_VIDEO_BYTES) {
+      await response.body?.cancel();
+      throw new Error('TikTok returned an invalid video range.');
+    }
     const bytes = new Uint8Array(await response.arrayBuffer());
-    const total = Number((response.headers.get('content-range') || '').split('/')[1]) || bytes.length;
+    if (!bytes.length || bytes.length > MAX_VIDEO_BYTES || (!whole && bytes.length !== Number(range[2]) - start + 1)) {
+      throw new Error('TikTok returned an incomplete video.');
+    }
+    const total = whole ? bytes.length : Number(range[3]);
     let binary = '';
     for (let i = 0; i < bytes.length; i += 0x8000) binary += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
-    return { data: btoa(binary), total, type: response.headers.get('content-type') || 'video/mp4', whole: response.status === 200 };
+    return { data: btoa(binary), total, type: response.headers.get('content-type') || 'video/mp4', whole };
   }
 
   api.runtime.onMessage.addListener((message, sender, sendResponse) => {

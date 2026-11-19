@@ -92,8 +92,9 @@ function track(item) {
     title: (useCaption ? caption || str(music.title) : str(music.title)) || 'Untitled clip',
     artist: useCaption ? (author ? `@${author}` : str(music.authorName)) : str(music.authorName) || (author ? `@${author}` : ''),
     duration: Number.isFinite(duration) && duration > 0 ? duration : null,
-    artwork: secure(item.video?.cover || item.video?.originCover || firstUrl(music.coverLarge) || music.coverMedium),
-    motion: secure(item.video?.dynamicCover),
+    artwork: secure(firstUrl(item.video?.cover)) || secure(firstUrl(item.video?.originCover)) ||
+      secure(firstUrl(music.coverLarge)) || secure(firstUrl(music.coverMedium)),
+    motion: secure(firstUrl(item.video?.dynamicCover)),
     video: '',
     audio: secure(music.playUrl)
   };

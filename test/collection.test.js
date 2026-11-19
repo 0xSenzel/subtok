@@ -139,6 +139,19 @@ test('tracks keep only https audio, video is empty, and skipped counts the rest'
   assert.strictEqual(r.body.skipped, 2);
 });
 
+test('public tracks resolve cover URL lists when the primary cover is invalid', async () => {
+  const clip = item('1', 'https://a/1.mp3');
+  clip.video = {
+    cover: 'http://a/insecure.jpg',
+    originCover: { urlList: ['https://a/still.jpg'] },
+    dynamicCover: { url_list: ['https://a/motion.gif'] }
+  };
+  stub(() => page({ itemList: [clip] }));
+  const { body: { tracks: [track] } } = await run({ id: '7707162500868999944' });
+  assert.strictEqual(track.artwork, 'https://a/still.jpg');
+  assert.strictEqual(track.motion, 'https://a/motion.gif');
+});
+
 test('pagination follows hasMore and cursor', async () => {
   stub((url, n) => (n === 1
     ? page({ itemList: [item('1', 'https://a/1.mp3')], hasMore: true, cursor: '30' })

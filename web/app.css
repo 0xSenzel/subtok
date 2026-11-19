@@ -181,7 +181,7 @@ svg { width: 24px; height: 24px; fill: none; stroke: currentColor; stroke-width:
 }
 .art svg { width: 45%; height: 45%; stroke-width: 1.25; }
 .art img, .art video { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
-.art video { opacity: 0; transition: opacity .4s ease; }
+.art video { object-fit: contain; background: #171311; opacity: 0; transition: opacity .4s ease; }
 .art video.ready { opacity: 1; }
 @media (prefers-reduced-motion: reduce) { .art video { transition: none; } }
 .track { margin-top: clamp(16px, 3dvh, 28px); min-height: 66px; }
