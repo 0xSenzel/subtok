@@ -39,6 +39,10 @@
   let playbackTimer = 0;
   let playbackPosition = 0;
   let recovering = null;
+  let wantsPlayback = false;
+  let waitingForNetwork = false;
+  let audioBlobUrl = '';
+  let reconnectTimer = 0;
 
   // Sample playlist. It plays from this site, so it needs no extension and never touches TikTok.
   const sampleUrl = file => new URL(`samples/${file}`, location.href).href;
@@ -112,6 +116,8 @@
         stopPlayback();
         audio.removeAttribute('src');
         audio.load();
+        releaseAudioUrl();
+        warmAudio();
         clearVisual();
         if ('mediaSession' in navigator) {
           navigator.mediaSession.metadata = null;
@@ -586,7 +592,14 @@
     const whole = Math.floor(seconds);
     return `${Math.floor(whole / 60)}:${String(whole % 60).padStart(2, '0')}`;
   }
+  function mediaAddresses(value) {
+    if (typeof value === 'string') return value ? [value] : [];
+    const addresses = Array.isArray(value) ? value : value?.urlList || value?.url_list;
+    return Array.isArray(addresses) ? addresses.filter(url => typeof url === 'string' && url) : [];
+  }
+
   function setArtwork(img, url) {
+    url = mediaAddresses(url)[0];
     img.hidden = !url;
     if (url) img.src = url;
     else img.removeAttribute('src');
@@ -647,7 +660,10 @@
   function select(i, autoplay) {
     selection += 1;
     recovering = null;
+    waitingForNetwork = false;
+    wantsPlayback = autoplay;
     clearTimeout(playbackTimer);
+    clearTimeout(reconnectTimer);
     playbackPosition = 0;
     index = i;
     const track = queue[i];
@@ -661,8 +677,8 @@
     showPosition(0, track.duration || 0);
     refreshNext();
     status.textContent = '';
-    prepareLeveling(track.audio);
-    audio.src = track.audio;
+    const localAudio = audioMemory.get(audioKey(track));
+    setTrackAudio(track, localAudio);
     if ('mediaSession' in navigator) navigator.mediaSession.setPositionState?.();
     sessionCover = fallbackArtwork;
     setNowPlaying(track);
@@ -677,8 +693,23 @@
       };
       cover.src = track.artwork;
     }
-    if (autoplay) play();
+    if (!localAudio && !navigator.onLine) recover();
+    else if (autoplay) play();
     else renderToggle();
+  }
+
+  // Keep one audio element for playback. A complete local file gives it the same seek and play controls as a stream.
+  function releaseAudioUrl() {
+    if (audioBlobUrl) URL.revokeObjectURL(audioBlobUrl);
+    audioBlobUrl = '';
+  }
+
+  function setTrackAudio(track, blob) {
+    const previous = audioBlobUrl;
+    audioBlobUrl = blob ? URL.createObjectURL(blob) : '';
+    prepareLeveling(track.audio, !!blob);
+    audio.src = audioBlobUrl || track.audio;
+    if (previous) URL.revokeObjectURL(previous);
   }
 
   // Lock screen, Control Center, and Dynamic Island details. Use the bundled cover when TikTok's is missing or fails.
@@ -696,6 +727,11 @@
 
   function play() {
     if (player.hidden || !audio.hasAttribute('src')) return;
+    wantsPlayback = true;
+    if (waitingForNetwork) {
+      if (navigator.onLine) select(index, true);
+      return;
+    }
     const selected = selection;
     renderToggle(true);
     watchPlayback();
@@ -710,8 +746,10 @@
   }
 
   function stopPlayback() {
+    wantsPlayback = false;
     recovering = null;
     clearTimeout(playbackTimer);
+    clearTimeout(reconnectTimer);
     audio.pause();
   }
 
@@ -778,20 +816,36 @@
   let shuffleOn = prefs.get('mcq.shuffle') === '1';
   let repeat = repeatModes.includes(prefs.get('mcq.repeat')) ? prefs.get('mcq.repeat') : 'off';
   let order = [];
+  let nextRound = null;
   let sleepMode = 0;
   let sleepAt = 0;
   let sleepTimer = 0;
   let sleepLabel = '';
 
-  // Put `first` at the front of a fresh random order. Pass -1 to shuffle every clip.
-  function buildOrder(first = index) {
-    order = queue.map((_, i) => i);
-    if (!shuffleOn) return;
-    for (let i = order.length - 1; i > 0; i--) {
+  function makeOrder(first) {
+    const indexes = queue.map((_, i) => i);
+    if (!shuffleOn) return indexes;
+    for (let i = indexes.length - 1; i > 0; i--) {
       const j = Math.floor(Math.random() * (i + 1));
-      [order[i], order[j]] = [order[j], order[i]];
+      [indexes[i], indexes[j]] = [indexes[j], indexes[i]];
     }
-    if (first >= 0) order = [first, ...order.filter(i => i !== first)];
+    return first < 0 ? indexes : [first, ...indexes.filter(i => i !== first)];
+  }
+
+  // Put the current clip first when starting a shuffled queue.
+  function buildOrder(first = index) {
+    order = makeOrder(first);
+    nextRound = null;
+  }
+
+  function repeatOrder() {
+    if (!nextRound) {
+      nextRound = makeOrder(-1);
+      if (nextRound.length > 1 && nextRound[0] === order.at(-1)) {
+        [nextRound[0], nextRound[1]] = [nextRound[1], nextRound[0]];
+      }
+    }
+    return nextRound;
   }
   const atEnd = () => order.indexOf(index) >= order.length - 1;
   // The queue index that plays after the current clip, or -1. After the last clip, repeat all starts a new round.
@@ -799,11 +853,14 @@
     const pos = order.indexOf(index);
     if (pos < order.length - 1) return order[pos + 1];
     if (repeat !== 'all') return -1;
-    buildOrder(-1);
-    if (order.length > 1 && order[0] === index) [order[0], order[1]] = [order[1], order[0]];
+    order = repeatOrder();
+    nextRound = null;
     return order[0];
   }
-  const refreshNext = () => { next.disabled = atEnd() && repeat !== 'all'; };
+  function refreshNext() {
+    next.disabled = atEnd() && repeat !== 'all';
+    warmAudio();
+  }
 
   function renderModes() {
     shuffleButton.setAttribute('aria-pressed', String(shuffleOn));
@@ -865,26 +922,50 @@
 
   // Keep the play order when clips are hidden, unhidden, merged, or refreshed: same clips in the same order, new ones last.
   function remapOrder(previous) {
+    nextRound = null;
     if (!shuffleOn) { order = queue.map((_, i) => i); return; }
     const at = new Map(queue.map((track, i) => [track.id, i]));
     const kept = order.map(i => at.get(previous[i]?.id)).filter(i => i !== undefined);
     order = [...kept, ...queue.map((_, i) => i).filter(i => !kept.includes(i))];
   }
 
-  // TikTok's audio addresses expire. Fetch fresh ones once, then skip clips that still fail.
+  // Use a complete local copy if a stream stops. Refresh expired TikTok URLs only when online.
   async function recover() {
     const failed = queue[index];
-    if (!failed || player.hidden || recovering === selection) return;
+    if (!failed || player.hidden || waitingForNetwork || recovering === selection) return;
     const selected = selection;
     const position = audio.currentTime;
+    const networkError = audio.error?.code === MediaError.MEDIA_ERR_NETWORK;
+    const key = audioKey(failed);
     recovering = selected;
     clearTimeout(playbackTimer);
+    const stillSelected = () => recovering === selected && selection === selected && !player.hidden;
+    if (audioBlobUrl) {
+      await discardAudio(key);
+      if (!stillSelected()) return;
+      if (navigator.onLine) {
+        rememberInterruptedPosition(failed, position);
+        return select(index, wantsPlayback);
+      }
+    } else {
+      const blob = await readAudio(key);
+      if (!stillSelected()) return;
+      if (blob) {
+        rememberInterruptedPosition(failed, position);
+        return select(index, wantsPlayback);
+      }
+    }
+    if (!stillSelected()) return;
+    if (!navigator.onLine) return waitForNetwork(failed, position);
+    const reachable = await canReachPlayer();
+    if (!stillSelected()) return;
+    if (!reachable) return waitForNetwork(failed, position, true);
     if (!collection.sample && Date.now() - refreshedAt > 60000) {
       refreshedAt = Date.now();
       status.textContent = 'Reconnecting to TikTok…';
       try {
         const result = await fetchTracks(collection);
-        if (recovering !== selected || selection !== selected || player.hidden) return;
+        if (!stillSelected()) return;
         if (result.tracks.length) {
           const previous = queue;
           all = result.tracks;
@@ -894,17 +975,21 @@
           const same = queue.findIndex(track => track.id === failed.id);
           if (!queue.length) return showAllHidden();
           if (same >= 0) {
-            if (!resumeAt && position > 0) resumeAt = { id: failed.id, t: position };
-            return select(same, true);
+            rememberInterruptedPosition(failed, position);
+            return select(same, wantsPlayback);
           }
-          return select(Math.min(index, queue.length - 1), true);
+          return select(Math.min(index, queue.length - 1), wantsPlayback);
         }
       } catch {
+        if (!stillSelected()) return;
+        if (!navigator.onLine || networkError) return waitForNetwork(failed, position);
         if (!fromLink(collection)) showConnection(); // Playback goes on; the clip may be skipped below.
       }
     }
-    if (recovering !== selected || selection !== selected || player.hidden) return;
+    if (!stillSelected()) return;
+    if (!navigator.onLine || networkError) return waitForNetwork(failed, position);
     recovering = null;
+    if (!wantsPlayback) return;
     failures += 1;
     if (failures >= queue.length || (atEnd() && repeat !== 'all')) {
       audio.pause();
@@ -914,6 +999,158 @@
     }
     select(stepNext(), true);
     status.textContent = `Skipped “${failed.title}” because it could not play.`;
+  }
+
+  async function canReachPlayer() {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 3000);
+    try {
+      const response = await fetch('/', { method: 'HEAD', cache: 'no-store', signal: controller.signal });
+      return response.ok;
+    } catch {
+      return false;
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
+  function rememberInterruptedPosition(track, position) {
+    if (!resumeAt && position > 0) resumeAt = { id: track.id, t: position, interrupted: true };
+  }
+
+  function waitForNetwork(track, position, retry = false) {
+    waitingForNetwork = true;
+    recovering = null;
+    saveResume();
+    rememberInterruptedPosition(track, position);
+    audio.pause();
+    renderToggle();
+    status.textContent = navigator.onLine && !retry ? 'Playback lost its connection. Tap play to retry.'
+      : 'You’re offline. Reconnect to play this clip.';
+    if (retry) checkForReconnect();
+  }
+
+  // Some browsers still report online when Wi-Fi is connected but internet access has dropped.
+  function checkForReconnect() {
+    if (!navigator.onLine || !wantsPlayback) return;
+    const selected = selection;
+    reconnectTimer = setTimeout(async () => {
+      const reachable = await canReachPlayer();
+      if (selected !== selection || !waitingForNetwork || !wantsPlayback || player.hidden) return;
+      if (reachable) {
+        select(index, true);
+        warmAudio(true);
+      } else checkForReconnect();
+    }, 4000);
+  }
+
+  // Save complete clips on this device. Signed URLs can change, so key by collection and clip.
+  const AUDIO_CACHE = 'subtok-audio-1';
+  const MAX_AUDIO_BYTES = 8 * 1024 * 1024;
+  const MAX_AUDIO_CLIPS = 8;
+  const audioMemory = new Map();
+  let warmPlan = null;
+
+  function audioKey(track) {
+    const source = collection.sample ? 'sample' : fromLink(collection) ? 'link' : 'extension';
+    return new URL(`/.audio-cache/${source}/${encodeURIComponent(collection.id)}/${encodeURIComponent(track.id)}`, location.origin).href;
+  }
+
+  function rememberAudio(key, blob) {
+    audioMemory.delete(key);
+    audioMemory.set(key, blob);
+    if (audioMemory.size > MAX_AUDIO_CLIPS) audioMemory.delete(audioMemory.keys().next().value);
+  }
+
+  async function readAudio(key) {
+    let blob = audioMemory.get(key);
+    if (!blob) {
+      try {
+        const response = await (await caches.open(AUDIO_CACHE)).match(key);
+        if (response) blob = await response.blob();
+      } catch { /* Storage can be blocked. */ }
+    }
+    if (blob?.size > 0 && blob.size <= MAX_AUDIO_BYTES) {
+      rememberAudio(key, blob);
+      return blob;
+    }
+  }
+
+  async function discardAudio(key) {
+    audioMemory.delete(key);
+    try { await (await caches.open(AUDIO_CACHE)).delete(key); } catch { /* Storage can be blocked. */ }
+  }
+
+  async function saveAudio(key, blob) {
+    try {
+      const cache = await caches.open(AUDIO_CACHE);
+      await cache.put(key, new Response(blob));
+      const entries = await cache.keys();
+      await Promise.all(entries.slice(0, Math.max(0, entries.length - MAX_AUDIO_CLIPS)).map(entry => cache.delete(entry)));
+    } catch { /* Keep the in-memory copy if storage is blocked or full. */ }
+  }
+
+  async function downloadAudio(url, signal) {
+    const source = new URL(url, location.href);
+    let response;
+    try {
+      response = await fetch(source, { credentials: 'omit', priority: 'low', signal });
+    } catch (error) {
+      if (signal.aborted || !navigator.onLine || source.protocol !== 'https:' ||
+          !/\.tiktokcdn(?:-us)?\.com$/.test(source.hostname)) throw error;
+      response = await fetch('/api/audio', { method: 'POST', body: source.href, credentials: 'omit', priority: 'low', signal });
+    }
+    const type = (response.headers.get('content-type') || 'application/octet-stream').split(';')[0].trim();
+    if (response.status !== 200 || !response.body || !/^(audio\/|video\/mp4$|application\/octet-stream$)/i.test(type) ||
+        Number(response.headers.get('content-length')) > MAX_AUDIO_BYTES) {
+      await response.body?.cancel();
+      return;
+    }
+    const parts = [];
+    let size = 0;
+    const reader = response.body.getReader();
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      size += value.byteLength;
+      if (size > MAX_AUDIO_BYTES) {
+        await reader.cancel();
+        return;
+      }
+      parts.push(value);
+    }
+    if (size) return new Blob(parts, { type });
+  }
+
+  function warmAudio(force = false) {
+    const position = order.indexOf(index);
+    const ahead = order.slice(position + 1, position + 3);
+    if (repeat === 'all' && order.length && ahead.length < 2) ahead.push(...repeatOrder().slice(0, 2 - ahead.length));
+    const clips = player.hidden ? [] : [...new Set([index, ...ahead])].map(i => queue[i]).filter(Boolean);
+    const targets = clips.map(track => [audioKey(track), track.audio]);
+    const signature = JSON.stringify(targets);
+    if (!force && warmPlan?.signature === signature) return;
+    warmPlan?.controller?.abort();
+    const plan = { signature, controller: null };
+    warmPlan = plan;
+    preloadAudio(plan, targets);
+  }
+
+  async function preloadAudio(plan, targets) {
+    for (const [key, url] of targets) {
+      if (warmPlan !== plan) return;
+      if (await readAudio(key) || warmPlan !== plan || !navigator.onLine) continue;
+      const controller = new AbortController();
+      plan.controller = controller;
+      const timeout = setTimeout(() => controller.abort(), 12000);
+      try {
+        const blob = await downloadAudio(url, controller.signal);
+        if (!blob || warmPlan !== plan) continue;
+        rememberAudio(key, blob);
+        await saveAudio(key, blob);
+      } catch { /* A host can deny background reads while still allowing direct playback. */ }
+      finally { clearTimeout(timeout); }
+    }
   }
 
   // Hidden clips. Listeners hide clips they are tired of without unsaving them on TikTok.
@@ -1052,13 +1289,13 @@
   }
 
   // Runs in select() before audio.src is set. Synchronous, so playback never waits on the probe.
-  function prepareLeveling(url) {
+  function prepareLeveling(url, local = false) {
     const known = corsHosts.get(hostOf(url));
-    if (evenOn && (!known || (!known.ok && Date.now() - known.at > 120000)) && !probing) probeCors(url).then(() => renderEven());
-    if (graph || (evenOn && ctx && known?.ok)) {
+    if (evenOn && !local && navigator.onLine && (!known || (!known.ok && Date.now() - known.at > 120000)) && !probing) probeCors(url).then(() => renderEven());
+    if (graph || (evenOn && ctx && (local || known?.ok))) {
       audio.crossOrigin = 'anonymous';
       levelNodes();
-      leveled = known?.ok !== false;
+      leveled = local || known?.ok !== false;
     } else {
       audio.removeAttribute('crossorigin');
       leveled = false;
@@ -1088,12 +1325,13 @@
     renderEven();
     const track = queue[index];
     if (!on || !track || !ctx || graph) return; // With a graph, the gain change above already applies to this clip.
-    if (!await probeCors(track.audio) || !evenOn) return;
+    if (audioBlobUrl) return prepareLeveling(track.audio, true);
+    const selected = selection;
+    if (!await probeCors(track.audio) || !evenOn || selected !== selection || player.hidden) return;
     // Reload this clip through the graph at the same position.
     const wasPlaying = !audio.paused;
     const position = audio.currentTime;
-    prepareLeveling(track.audio);
-    audio.src = track.audio;
+    setTrackAudio(track);
     audio.addEventListener('loadedmetadata', () => { audio.currentTime = position; }, { once: true });
     if (wasPlaying) play();
   }
@@ -1507,6 +1745,7 @@
   });
   audio.addEventListener('playing', () => {
     if (player.hidden) return;
+    recovering = null;
     watchPlayback();
     if (status.textContent.startsWith('Reconnecting') || status.textContent.startsWith('Tap play')) status.textContent = '';
     renderToggle();
@@ -1526,7 +1765,7 @@
     if (repeat === 'one') { audio.currentTime = 0; play(); return; }
     const n = stepNext();
     if (n >= 0) select(n, true);
-    else { status.textContent = 'End of queue.'; renderToggle(); updateSession(); }
+    else { wantsPlayback = false; status.textContent = 'End of queue.'; renderToggle(); updateSession(); }
   });
   audio.addEventListener('error', () => {
     if (queue.length && audio.getAttribute('src')) recover();
@@ -1534,7 +1773,9 @@
   art.addEventListener('error', () => {
     // An animated cover that fails falls back to the still cover first.
     const current = queue[index];
-    if (current?.motion && current.artwork && current.motion !== current.artwork && art.getAttribute('src') === current.motion) return setArtwork(art, current.artwork);
+    const [motion] = mediaAddresses(current?.motion);
+    const [still] = mediaAddresses(current?.artwork);
+    if (motion && still && motion !== still && art.getAttribute('src') === motion) return setArtwork(art, still);
     art.hidden = true;
   });
 
@@ -1558,8 +1799,10 @@
 
   const clipVideo = player.querySelector('.art video');
   const MAX_VIDEO_BYTES = 20 * 1024 * 1024;
-  const videoUrls = new Map(); // Clip id to object URL, oldest first.
+  const videoUrls = new Map(); // Video address to object URL, oldest first.
+  const failedVideos = new Set();
   let videoFor = null;
+  let videoAddress = '';
   let videoJob = 0;
   let loadingVideo = null;
   clipVideo.loop = true;
@@ -1567,6 +1810,12 @@
   function clearVisual() {
     videoJob += 1;
     videoFor = null;
+    failedVideos.clear();
+    unloadVideo();
+  }
+
+  function unloadVideo() {
+    videoAddress = '';
     clipVideo.classList.remove('ready');
     clipVideo.pause();
     clipVideo.hidden = true;
@@ -1579,57 +1828,98 @@
   function showVisual(track) {
     clearVisual();
     videoFor = track.id;
-    setArtwork(art, track.motion || track.artwork);
+    setArtwork(art, mediaAddresses(track.motion)[0] || track.artwork);
     loadVideo(track);
   }
 
+  function videoAddresses(track) {
+    // Older saved collections can contain the address object from TikTok.
+    return [...new Set([
+      ...mediaAddresses(track.video), ...mediaAddresses(track.videoFallbacks)
+    ].filter(url => /^https:\/\//.test(url)))];
+  }
+
+  async function downloadVideo(address, job) {
+    const parts = [];
+    let start = 0;
+    let total;
+    let type;
+    do {
+      const piece = await ask('video', { url: address, start });
+      if (job !== videoJob || document.hidden) return;
+      if (!Number.isSafeInteger(piece.total) || piece.total <= 0 || piece.total > MAX_VIDEO_BYTES ||
+          (total && piece.total !== total) || (piece.whole && start !== 0)) throw new Error('Invalid video size.');
+      total = piece.total;
+      if (typeof piece.data !== 'string' || piece.data.length > Math.ceil((total - start) / 3) * 4) {
+        throw new Error('Invalid video piece.');
+      }
+      const text = atob(piece.data);
+      const bytes = new Uint8Array(text.length);
+      for (let i = 0; i < text.length; i++) bytes[i] = text.charCodeAt(i);
+      if (!bytes.length || start + bytes.length > total || (piece.whole && bytes.length !== total)) {
+        throw new Error('Incomplete video piece.');
+      }
+      parts.push(bytes);
+      type ??= /^video\//i.test(piece.type || '') ? piece.type : 'video/mp4';
+      start += bytes.length;
+    } while (start < total);
+    return new Blob(parts, { type });
+  }
+
   async function loadVideo(track) {
-    if (player.hidden || document.hidden || !track.video || videoFor !== track.id ||
+    if (player.hidden || document.hidden || !track || videoFor !== track.id ||
         clipVideo.hasAttribute('src') || loadingVideo === videoJob) return;
     const job = videoJob;
-    let url = videoUrls.get(track.id);
-    if (url) videoUrls.delete(track.id);
-    else {
-      loadingVideo = job;
-      try {
-        const parts = [];
-        let start = 0;
-        let total = Infinity;
-        let type = 'video/mp4';
-        while (start < total) {
-          const piece = await ask('video', { url: track.video, start });
-          if (job !== videoJob || document.hidden) return;
-          if (piece.total > MAX_VIDEO_BYTES) return;
-          const text = atob(piece.data);
-          const bytes = new Uint8Array(text.length);
-          for (let i = 0; i < text.length; i++) bytes[i] = text.charCodeAt(i);
-          parts.push(bytes);
-          ({ total, type } = piece);
-          start += bytes.length;
-          if (piece.whole || !bytes.length) break;
+    loadingVideo = job;
+    try {
+      for (const address of videoAddresses(track)) {
+        if (failedVideos.has(address)) continue;
+        let url = videoUrls.get(address);
+        if (!url) {
+          if (!navigator.onLine) continue;
+          try {
+            const blob = await downloadVideo(address, job);
+            if (!blob || job !== videoJob || document.hidden) return;
+            url = URL.createObjectURL(blob);
+          } catch {
+            if (job !== videoJob || document.hidden || !navigator.onLine) return;
+            failedVideos.add(address);
+            continue;
+          }
         }
-        url = URL.createObjectURL(new Blob(parts, { type }));
-      } catch {
-        return; // The animated or still cover stays.
-      } finally {
-        if (loadingVideo === job) loadingVideo = null;
+        videoUrls.delete(address);
+        videoUrls.set(address, url);
+        if (videoUrls.size > 3) {
+          const [oldAddress, oldUrl] = videoUrls.entries().next().value;
+          videoUrls.delete(oldAddress);
+          URL.revokeObjectURL(oldUrl);
+        }
+        videoAddress = address;
+        clipVideo.src = url;
+        clipVideo.hidden = false;
+        return;
       }
+    } finally {
+      if (loadingVideo === job) loadingVideo = null;
     }
-    videoUrls.set(track.id, url);
-    for (const [id, old] of videoUrls) {
-      if (videoUrls.size <= 3) break;
-      videoUrls.delete(id);
-      URL.revokeObjectURL(old);
-    }
-    if (job !== videoJob) return;
-    clipVideo.addEventListener('loadeddata', () => {
-      if (job !== videoJob) return;
-      clipVideo.classList.add('ready');
-      syncVideo(true);
-    }, { once: true });
-    clipVideo.src = url;
-    clipVideo.hidden = false;
   }
+
+  function revealVideo() {
+    if (!videoAddress || clipVideo.readyState < 2 || !clipVideo.videoWidth || clipVideo.classList.contains('ready')) return;
+    clipVideo.classList.add('ready');
+    syncVideo(true);
+  }
+  clipVideo.addEventListener('loadeddata', revealVideo);
+  clipVideo.addEventListener('canplay', revealVideo);
+  clipVideo.addEventListener('error', () => {
+    if (!videoAddress || !clipVideo.error) return;
+    failedVideos.add(videoAddress);
+    videoUrls.delete(videoAddress);
+    const url = clipVideo.getAttribute('src');
+    unloadVideo();
+    URL.revokeObjectURL(url);
+    loadVideo(queue[index]);
+  });
 
   // Keep the picture with the sound. The video loops when the sound runs longer than the clip.
   function syncVideo(force = false) {
@@ -1643,6 +1933,11 @@
   }
 
   for (const event of ['playing', 'pause', 'seeked']) audio.addEventListener(event, () => syncVideo(true));
+  audio.addEventListener('waiting', () => {
+    clipVideo.pause();
+    const track = queue[index];
+    if (track && !audioBlobUrl && audio.currentTime > 0 && !audio.seeking && audioMemory.has(audioKey(track))) recover();
+  });
   audio.addEventListener('timeupdate', () => syncVideo());
   document.addEventListener('visibilitychange', () => {
     if (document.visibilityState !== 'visible') return clipVideo.pause();
@@ -1725,7 +2020,8 @@
       anchor = merged.indexOf(track);
       added += 1;
     }
-    const sig = track => [track.id, track.audio, track.title, track.artist, track.artwork, track.duration, track.motion, track.video].join('|');
+    const sig = track => JSON.stringify([track.id, track.audio, track.title, track.artist, track.artwork,
+      track.duration, track.motion, track.video, track.videoFallbacks]);
     if (merged.map(sig).join('\n') === all.map(sig).join('\n')) return 0;
     all = merged;
     const previous = queue;
@@ -1735,11 +2031,12 @@
     renderQueue();
     queueList.querySelectorAll(':scope > li > button:first-child').forEach((button, n) => button.setAttribute('aria-current', String(n === index)));
     refreshNext();
+    loadVideo(queue[index]);
     return added;
   }
 
   async function refresh() {
-    if (refreshing || !collection || collection.sample || player.hidden) return;
+    if (refreshing || !navigator.onLine || !collection || collection.sample || player.hidden) return;
     refreshing = true;
     const choice = collection;
     try {
@@ -1754,7 +2051,7 @@
       const added = mergeTracks(result.tracks);
       if (added) status.textContent = `${added} new ${added === 1 ? 'clip' : 'clips'} added.`;
     } catch {
-      if (collection === choice && !player.hidden) {
+      if (navigator.onLine && collection === choice && !player.hidden) {
         // The cached list keeps playing. A link has no extension to blame, so it gets a quiet line.
         if (fromLink(choice)) status.textContent = 'Couldn’t refresh from TikTok. Your saved list keeps playing.';
         else showConnection();
@@ -1827,25 +2124,37 @@
   }
 
   async function checkInBackground() {
+    if (!navigator.onLine) return;
     if (fromLink(collection)) return refresh();
     const result = await checkConnection();
-    if (collection && !player.hidden) showConnectionFix(result);
+    if (navigator.onLine && collection && !player.hidden) showConnectionFix(result);
   }
 
   audio.addEventListener('playing', () => {
     const target = resumeAt;
     resumeAt = null;
     if (!target || target.id !== queue[index]?.id) return;
-    if (target.t < audio.duration - 3) audio.currentTime = target.t; // Near the end: start the clip over.
+    // A saved clip near the end starts over. A clip interrupted during playback keeps its position.
+    if (target.interrupted || target.t < audio.duration - 3) {
+      audio.currentTime = Math.min(target.t, Math.max(0, audio.duration - 0.05));
+    }
   });
   audio.addEventListener('pause', () => { if (!player.hidden) saveResume(); });
   setInterval(() => { if (!audio.paused) saveResume(); }, 5000);
   setInterval(refresh, 30 * 60 * 1000);
   addEventListener('pagehide', saveResume);
+  addEventListener('online', () => {
+    if (player.hidden) return;
+    if (waitingForNetwork) select(index, wantsPlayback);
+    warmAudio(true);
+    failedVideos.clear();
+    loadVideo(queue[index]);
+  });
   document.addEventListener('visibilitychange', () => {
     if (document.visibilityState === 'hidden') return saveResume();
     if (Date.now() - lastFresh >= 10 * 60 * 1000) refresh();
   });
 
+  if ('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js').catch(() => {});
   start();
 })();

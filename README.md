@@ -15,7 +15,7 @@ Play your saved TikTok collections as playlists. The website in `web/` is the pl
 9. iPhone doesn't let websites appear in the Share menu. On iPhone, copy the link in TikTok and paste it into Subtok.
 10. On iPhone, any browser plays a collection from a link. The extension needs Safari. While audio plays, you can lock the phone or switch apps. If iOS shows Now Playing controls, use them to pause or skip.
 
-The player shows the clip video while the page is visible and falls back to cover art when the video is unavailable. A collection from a link shows cover art only, because TikTok's video addresses need a sign-in. On iPhone, Safari can send still artwork and playback commands to iOS. iOS chooses the Now Playing layout. The website can't put moving video in the Dynamic Island.
+The player fits the full clip video in the frame while the page is visible. If the video can't play, Subtok shows cover art. A collection from a link shows cover art because TikTok's video addresses need a sign-in. On iPhone, Safari can send still artwork and playback commands to iOS. iOS chooses the Now Playing layout. The website can't put moving video in the Dynamic Island.
 
 The player opens your last collection instantly from a saved copy and resumes where you stopped. It refreshes from TikTok in the background, so new saves appear on their own.
 
@@ -33,17 +33,21 @@ Below the controls:
 
 Sign-in stays on TikTok. The extension reads collections in a TikTok tab through internal endpoints that can change. For a link, the `api/collection.js` function on Vercel resolves the share link and reads the collection from the same endpoint without a session. It fetches only `vt.tiktok.com`, `vm.tiktok.com`, and `www.tiktok.com`, and returns only the clip details the player needs. Vercel's CDN caches a successful `?id=` refresh for 60 seconds. Browsers and link lookups are never cached. A Vercel Firewall rule limits `/api/collection` to 30 requests per minute from one IP address and answers `429` above that. The player then asks the visitor to wait a minute. The rule lives in the Vercel project's **Firewall** settings, not in this repository. The website streams audio from TikTok and tries a fresh address if playback fails or stalls. For the visible player, the extension fetches the current clip's video in pieces. The website plays it muted, in sync with the audio.
 
-The browser saves the last loaded collection's details and links for up to 500 clips, plus resume positions, folders, hidden clips, and preferences. The open tab keeps up to three video clips, with a 20 MiB limit per clip. The player does not save media for offline playback.
+Subtok preloads the current clip and the next two in playback order. The browser saves up to eight complete audio clips, up to 8 MiB each. If a TikTok host blocks direct preloading, Subtok can send the audio address to its same-origin relay. The relay transfers up to 4 MiB from approved TikTok media addresses and sends no TikTok cookies. The device keeps the cached audio.
+
+After the browser saves the player page, you can reopen the last collection during an outage and play cached clips. If a clip is missing from the cache, Subtok keeps the selection and retries when the connection returns. Browser autoplay rules can still require you to press **Play**.
+
+The browser saves the last collection's details and links for up to 500 clips, plus resume positions, folders, hidden clips, and preferences. The open tab keeps up to three videos, with a 20 MiB limit per video.
 
 ## Run it locally
 
-Serve the website and the link function on port 8790:
+Serve the website and its functions on port 8790.
 
 ```sh
 node scripts/dev-server.js
 ```
 
-Open `http://127.0.0.1:8790/` to use the local player. The script uses only Node built-ins (Node 18 or later). `python3 -m http.server` serves the site but can't run the link function, so **Paste a collection link** fails with it. Set `PORT` to change the port. Set `HOST=0.0.0.0` to open the player from a phone on your network at `http://<your Mac's address>:8790/`. That also lets anyone on the network use the function, so use it only on a network you trust. The extension toolbar opens the hosted player. The extension accepts collection requests from the production domain and loopback development addresses. Any page at an allowed address can request collections through the extension.
+Open `http://127.0.0.1:8790/` to use the local player. The script uses only Node built-ins (Node 18 or later). `python3 -m http.server` serves the site but can't run the collection or audio functions. Set `PORT` to change the port. Set `HOST=0.0.0.0` to open the player from a phone on your network at `http://<your Mac's address>:8790/`. Use a trusted network because other devices on the network can reach the server. Use HTTPS or loopback to test the offline player page. The extension toolbar opens the hosted player. The extension accepts collection requests from the production domain and loopback development addresses. Any page at an allowed address can request collections through the extension.
 
 Run the tests with `node --test`. They use Node's built-in runner and never call TikTok.
 
